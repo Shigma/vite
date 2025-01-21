@@ -1,5 +1,7 @@
 # Preview Options
 
+Unless noted, the options in this section are only applied to preview.
+
 ## preview.host
 
 - **Type:** `string | boolean`
@@ -16,6 +18,15 @@ There are cases when other servers might respond instead of Vite.
 See [`server.host`](./server-options#server-host) for more details.
 
 :::
+
+## preview.allowedHosts
+
+- **Type:** `string | true`
+- **Default:** [`server.allowedHosts`](./server-options#server-allowedhosts)
+
+The hostnames that Vite is allowed to respond to.
+
+See [`server.allowedHosts`](./server-options#server-allowedhosts) for more details.
 
 ## preview.port
 
