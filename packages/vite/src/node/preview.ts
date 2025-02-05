@@ -5,7 +5,6 @@ import compression from '@polka/compression'
 import connect from 'connect'
 import type { Connect } from 'dep-types/connect'
 import corsMiddleware from 'cors'
-import { DEFAULT_PREVIEW_PORT } from './constants'
 import type {
   HttpServer,
   ResolvedServerOptions,
@@ -37,10 +36,14 @@ import { bindCLIShortcuts } from './shortcuts'
 import type { BindCLIShortcutsOptions } from './shortcuts'
 import { resolveConfig } from './config'
 import type { InlineConfig, ResolvedConfig } from './config'
+import { DEFAULT_PREVIEW_PORT } from './constants'
+import type { RequiredExceptFor } from './typeUtils'
+import { hostCheckMiddleware } from './server/middlewares/hostCheck'
 
 export interface PreviewOptions extends CommonServerOptions {}
 
-export interface ResolvedPreviewOptions extends PreviewOptions {}
+export interface ResolvedPreviewOptions
+  extends RequiredExceptFor<PreviewOptions, 'host' | 'https' | 'proxy'> {}
 
 export function resolvePreviewOptions(
   preview: PreviewOptions | undefined,
@@ -50,9 +53,10 @@ export function resolvePreviewOptions(
   // except for the port to enable having both the dev and preview servers running
   // at the same time without extra configuration
   return {
-    port: preview?.port,
+    port: preview?.port ?? DEFAULT_PREVIEW_PORT,
     strictPort: preview?.strictPort ?? server.strictPort,
     host: preview?.host ?? server.host,
+    allowedHosts: preview?.allowedHosts ?? server.allowedHosts,
     https: preview?.https ?? server.https,
     open: preview?.open ?? server.open,
     proxy: preview?.proxy ?? server.proxy,
@@ -84,8 +88,8 @@ export interface PreviewServer {
    */
   httpServer: HttpServer
   /**
-   * The resolved urls Vite prints on the CLI.
-   * null before server is listening.
+   * The resolved urls Vite prints on the CLI (URL-encoded). Returns `null`
+   * if the server is not listening on any port.
    */
   resolvedUrls: ResolvedServerUrls | null
   /**
@@ -117,7 +121,8 @@ export async function preview(
     true,
   )
 
-  const distDir = path.resolve(config.root, config.build.outDir)
+  const clientOutDir = config.environments.client.build.outDir
+  const distDir = path.resolve(config.root, clientOutDir)
   if (
     !fs.existsSync(distDir) &&
     // error if no plugins implement `configurePreviewServer`
@@ -128,7 +133,7 @@ export async function preview(
     process.argv[2] === 'preview'
   ) {
     throw new Error(
-      `The directory "${config.build.outDir}" does not exist. Did you build your project?`,
+      `The directory "${clientOutDir}" does not exist. Did you build your project?`,
     )
   }
 
@@ -136,7 +141,7 @@ export async function preview(
   const httpServer = await resolveHttpServer(
     config.preview,
     app,
-    await resolveHttpsConfig(config.preview?.https),
+    await resolveHttpsConfig(config.preview.https),
   )
   setClientErrorHandler(httpServer, config.logger)
 
@@ -145,13 +150,23 @@ export async function preview(
 
   const closeHttpServer = createServerCloseFn(httpServer)
 
+  // Promise used by `server.close()` to ensure `closeServer()` is only called once
+  let closeServerPromise: Promise<void> | undefined
+  const closeServer = async () => {
+    teardownSIGTERMListener(closeServerAndExit)
+    await closeHttpServer()
+    server.resolvedUrls = null
+  }
+
   const server: PreviewServer = {
     config,
     middlewares: app,
     httpServer,
     async close() {
-      teardownSIGTERMListener(closeServerAndExit)
-      await closeHttpServer()
+      if (!closeServerPromise) {
+        closeServerPromise = closeServer()
+      }
+      return closeServerPromise
     },
     resolvedUrls: null,
     printUrls() {
@@ -166,10 +181,11 @@ export async function preview(
     },
   }
 
-  const closeServerAndExit = async () => {
+  const closeServerAndExit = async (_: unknown, exitCode?: number) => {
     try {
       await server.close()
     } finally {
+      process.exitCode ??= exitCode ? 128 + exitCode : undefined
       process.exit()
     }
   }
@@ -186,6 +202,13 @@ export async function preview(
   const { cors } = config.preview
   if (cors !== false) {
     app.use(corsMiddleware(typeof cors === 'boolean' ? {} : cors))
+  }
+
+  // host check (to prevent DNS rebinding attacks)
+  const { allowedHosts } = config.preview
+  // no need to check for HTTPS as HTTPS is not vulnerable to DNS rebinding attacks
+  if (allowedHosts !== true && !config.preview.https) {
+    app.use(hostCheckMiddleware(config, true))
   }
 
   // proxy
@@ -240,10 +263,9 @@ export async function preview(
   }
 
   const hostname = await resolveHostname(options.host)
-  const port = options.port ?? DEFAULT_PREVIEW_PORT
 
   await httpServerStart(httpServer, {
-    port,
+    port: options.port,
     strictPort: options.strictPort,
     host: hostname.host,
     logger,
@@ -256,7 +278,7 @@ export async function preview(
   )
 
   if (options.open) {
-    const url = server.resolvedUrls?.local[0] ?? server.resolvedUrls?.network[0]
+    const url = server.resolvedUrls.local[0] ?? server.resolvedUrls.network[0]
     if (url) {
       const path =
         typeof options.open === 'string' ? new URL(options.open, url).href : url

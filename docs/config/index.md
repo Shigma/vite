@@ -8,8 +8,7 @@ When running `vite` from the command line, Vite will automatically try to resolv
 
 The most basic config file looks like this:
 
-```js
-// vite.config.js
+```js [vite.config.js]
 export default {
   // config options
 }
@@ -22,6 +21,10 @@ You can also explicitly specify a config file to use with the `--config` CLI opt
 ```bash
 vite --config my-config.js
 ```
+
+::: tip BUNDLING THE CONFIG
+By default, Vite uses `esbuild` to bundle the config into a temporary file. This can cause issues when importing TypeScript files in a monorepo. If you encounter any issues with this approach, you can specify `--configLoader=runner` to use the module runner instead - it will not create a temporary config and will transform any files on the fly. Note that module runner doesn't support CJS in config files, but external CJS packages should work as usual.
+:::
 
 ## Config Intellisense
 
@@ -103,9 +106,10 @@ Note that Vite doesn't load `.env` files by default as the files to load can onl
 ```js twoslash
 import { defineConfig, loadEnv } from 'vite'
 
-export default defineConfig(({ command, mode }) => {
+export default defineConfig(({ mode }) => {
   // Load env file based on `mode` in the current working directory.
-  // Set the third parameter to '' to load all env regardless of the `VITE_` prefix.
+  // Set the third parameter to '' to load all env regardless of the
+  // `VITE_` prefix.
   const env = loadEnv(mode, process.cwd(), '')
   return {
     // vite config

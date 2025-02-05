@@ -40,7 +40,6 @@ import type {
   FunctionPluginHooks,
   InputOptions,
   LoadResult,
-  MinimalPluginContext,
   ModuleInfo,
   ModuleOptions,
   NormalizedInputOptions,
@@ -48,9 +47,11 @@ import type {
   ParallelPluginHooks,
   PartialNull,
   PartialResolvedId,
+  PluginContextMeta,
   ResolvedId,
   RollupError,
   RollupLog,
+  MinimalPluginContext as RollupMinimalPluginContext,
   PluginContext as RollupPluginContext,
   TransformPluginContext as RollupTransformPluginContext,
   SourceDescription,
@@ -77,13 +78,16 @@ import {
   timeFrom,
 } from '../utils'
 import { FS_PREFIX } from '../constants'
-import type { PluginHookUtils, ResolvedConfig } from '../config'
 import { createPluginHookUtils, getHookHandler } from '../plugins'
 import { cleanUrl, unwrapId } from '../../shared/utils'
+import type { PluginHookUtils } from '../config'
+import type { Environment } from '../environment'
+import type { DevEnvironment } from './environment'
 import { buildErrorMessage } from './middlewares/error'
-import type { ModuleGraph, ModuleNode } from './moduleGraph'
-
-const noop = () => {}
+import type {
+  EnvironmentModuleGraph,
+  EnvironmentModuleNode,
+} from './moduleGraph'
 
 // same default value of "moduleInfo.meta" as in Rollup
 const EMPTY_OBJECT = Object.freeze({})
@@ -100,6 +104,9 @@ const debugPluginResolve = createDebugger('vite:plugin-resolve', {
 const debugPluginTransform = createDebugger('vite:plugin-transform', {
   onlyWhenFocused: 'vite:plugin',
 })
+const debugPluginContainerContext = createDebugger(
+  'vite:plugin-container-context',
+)
 
 export const ERR_CLOSED_SERVER = 'ERR_CLOSED_SERVER'
 
@@ -120,58 +127,76 @@ export interface PluginContainerOptions {
   writeFile?: (name: string, source: string | Uint8Array) => void
 }
 
-export async function createPluginContainer(
-  config: ResolvedConfig,
-  moduleGraph?: ModuleGraph,
+/**
+ * Create a plugin container with a set of plugins. We pass them as a parameter
+ * instead of using environment.plugins to allow the creation of different
+ * pipelines working with the same environment (used for createIdResolver).
+ */
+export async function createEnvironmentPluginContainer(
+  environment: Environment,
+  plugins: Plugin[],
   watcher?: FSWatcher,
-): Promise<PluginContainer> {
-  const container = new PluginContainer(config, moduleGraph, watcher)
+  autoStart = true,
+): Promise<EnvironmentPluginContainer> {
+  const container = new EnvironmentPluginContainer(
+    environment,
+    plugins,
+    watcher,
+    autoStart,
+  )
   await container.resolveRollupOptions()
   return container
 }
 
-class PluginContainer {
+export type SkipInformation = {
+  id: string
+  importer: string | undefined
+  plugin: Plugin
+  called?: boolean
+}
+
+class EnvironmentPluginContainer {
   private _pluginContextMap = new Map<Plugin, PluginContext>()
-  private _pluginContextMapSsr = new Map<Plugin, PluginContext>()
   private _resolvedRollupOptions?: InputOptions
   private _processesing = new Set<Promise<any>>()
   private _seenResolves: Record<string, true | undefined> = {}
-  private _closed = false
+
   // _addedFiles from the `load()` hook gets saved here so it can be reused in the `transform()` hook
   private _moduleNodeToLoadAddedImports = new WeakMap<
-    ModuleNode,
+    EnvironmentModuleNode,
     Set<string> | null
   >()
 
   getSortedPluginHooks: PluginHookUtils['getSortedPluginHooks']
   getSortedPlugins: PluginHookUtils['getSortedPlugins']
 
+  moduleGraph: EnvironmentModuleGraph | undefined
   watchFiles = new Set<string>()
   minimalContext: MinimalPluginContext
 
+  private _started = false
+  private _buildStartPromise: Promise<void> | undefined
+  private _closed = false
+
   /**
-   * @internal use `createPluginContainer` instead
+   * @internal use `createEnvironmentPluginContainer` instead
    */
   constructor(
-    public config: ResolvedConfig,
-    public moduleGraph?: ModuleGraph,
+    public environment: Environment,
+    public plugins: Plugin[],
     public watcher?: FSWatcher,
-    public plugins = config.plugins,
+    autoStart = true,
   ) {
-    this.minimalContext = {
-      meta: {
-        rollupVersion,
-        watchMode: true,
-      },
-      debug: noop,
-      info: noop,
-      warn: noop,
-      // @ts-expect-error noop
-      error: noop,
-    }
+    this._started = !autoStart
+    this.minimalContext = new MinimalPluginContext(
+      { rollupVersion, watchMode: true },
+      environment,
+    )
     const utils = createPluginHookUtils(plugins)
     this.getSortedPlugins = utils.getSortedPlugins
     this.getSortedPluginHooks = utils.getSortedPluginHooks
+    this.moduleGraph =
+      environment.mode === 'dev' ? environment.moduleGraph : undefined
   }
 
   private _updateModuleLoadAddedImports(
@@ -236,7 +261,7 @@ class PluginContainer {
 
   async resolveRollupOptions(): Promise<InputOptions> {
     if (!this._resolvedRollupOptions) {
-      let options = this.config.build.rollupOptions
+      let options = this.environment.config.build.rollupOptions
       for (const optionsHook of this.getSortedPluginHooks('options')) {
         if (this._closed) {
           throwClosedServerError()
@@ -251,13 +276,11 @@ class PluginContainer {
     return this._resolvedRollupOptions
   }
 
-  private _getPluginContext(plugin: Plugin, ssr: boolean) {
-    const map = ssr ? this._pluginContextMapSsr : this._pluginContextMap
-    if (!map.has(plugin)) {
-      const ctx = new PluginContext(plugin, this, ssr)
-      map.set(plugin, ctx)
+  private _getPluginContext(plugin: Plugin) {
+    if (!this._pluginContextMap.has(plugin)) {
+      this._pluginContextMap.set(plugin, new PluginContext(plugin, this))
     }
-    return map.get(plugin)!
+    return this._pluginContextMap.get(plugin)!
   }
 
   // parallel, ignores returns
@@ -265,13 +288,14 @@ class PluginContainer {
     hookName: H,
     context: (plugin: Plugin) => ThisType<FunctionPluginHooks[H]>,
     args: (plugin: Plugin) => Parameters<FunctionPluginHooks[H]>,
+    condition?: (plugin: Plugin) => boolean | undefined,
   ): Promise<void> {
     const parallelPromises: Promise<unknown>[] = []
     for (const plugin of this.getSortedPlugins(hookName)) {
       // Don't throw here if closed, so buildEnd and closeBundle hooks can finish running
-      const hook = plugin[hookName]
-      if (!hook) continue
+      if (condition && !condition(plugin)) continue
 
+      const hook = plugin[hookName]
       const handler: Function = getHookHandler(hook)
       if ((hook as { sequential?: boolean }).sequential) {
         await Promise.all(parallelPromises)
@@ -285,23 +309,41 @@ class PluginContainer {
   }
 
   async buildStart(_options?: InputOptions): Promise<void> {
-    await this.handleHookPromise(
+    if (this._started) {
+      if (this._buildStartPromise) {
+        await this._buildStartPromise
+      }
+      return
+    }
+    this._started = true
+    const config = this.environment.getTopLevelConfig()
+    this._buildStartPromise = this.handleHookPromise(
       this.hookParallel(
         'buildStart',
-        (plugin) => this._getPluginContext(plugin, false),
+        (plugin) => this._getPluginContext(plugin),
         () => [this.options as NormalizedInputOptions],
+        (plugin) =>
+          this.environment.name === 'client' ||
+          config.server.perEnvironmentStartEndDuringDev ||
+          plugin.perEnvironmentStartEndDuringDev,
       ),
-    )
+    ) as Promise<void>
+    await this._buildStartPromise
+    this._buildStartPromise = undefined
   }
 
   async resolveId(
     rawId: string,
-    importer: string | undefined = join(this.config.root, 'index.html'),
+    importer: string | undefined = join(
+      this.environment.config.root,
+      'index.html',
+    ),
     options?: {
       attributes?: Record<string, string>
       custom?: CustomPluginOptions
+      /** @deprecated use `skipCalls` instead */
       skip?: Set<Plugin>
-      ssr?: boolean
+      skipCalls?: readonly SkipInformation[]
       /**
        * @internal
        */
@@ -309,19 +351,30 @@ class PluginContainer {
       isEntry?: boolean
     },
   ): Promise<PartialResolvedId | null> {
+    if (!this._started) {
+      this.buildStart()
+      await this._buildStartPromise
+    }
     const skip = options?.skip
-    const ssr = options?.ssr
+    const skipCalls = options?.skipCalls
     const scan = !!options?.scan
-    const ctx = new ResolveIdContext(this, !!ssr, skip, scan)
+    const ssr = this.environment.config.consumer === 'server'
+    const ctx = new ResolveIdContext(this, skip, skipCalls, scan)
+
+    const mergedSkip = new Set<Plugin>(skip)
+    for (const call of skipCalls ?? []) {
+      if (call.called || (call.id === rawId && call.importer === importer)) {
+        mergedSkip.add(call.plugin)
+      }
+    }
 
     const resolveStart = debugResolve ? performance.now() : 0
     let id: string | null = null
     const partial: Partial<PartialResolvedId> = {}
-
     for (const plugin of this.getSortedPlugins('resolveId')) {
-      if (this._closed && !ssr) throwClosedServerError()
-      if (!plugin.resolveId) continue
-      if (skip?.has(plugin)) continue
+      if (this._closed && this.environment.config.dev.recoverable)
+        throwClosedServerError()
+      if (mergedSkip?.has(plugin)) continue
 
       ctx._plugin = plugin
 
@@ -348,7 +401,7 @@ class PluginContainer {
       debugPluginResolve?.(
         timeFrom(pluginResolveStart),
         plugin.name,
-        prettifyUrl(id, this.config.root),
+        prettifyUrl(id, this.environment.config.root),
       )
 
       // resolveId() is hookFirst - first non-null result is returned.
@@ -376,22 +429,17 @@ class PluginContainer {
     }
   }
 
-  async load(
-    id: string,
-    options?: {
-      ssr?: boolean
-    },
-  ): Promise<LoadResult | null> {
-    const ssr = options?.ssr
-    const ctx = new LoadPluginContext(this, !!ssr)
-
+  async load(id: string): Promise<LoadResult | null> {
+    const ssr = this.environment.config.consumer === 'server'
+    const options = { ssr }
+    const ctx = new LoadPluginContext(this)
     for (const plugin of this.getSortedPlugins('load')) {
-      if (this._closed && !ssr) throwClosedServerError()
-      if (!plugin.load) continue
+      if (this._closed && this.environment.config.dev.recoverable)
+        throwClosedServerError()
       ctx._plugin = plugin
       const handler = getHookHandler(plugin.load)
       const result = await this.handleHookPromise(
-        handler.call(ctx as any, id, { ssr }),
+        handler.call(ctx as any, id, options),
       )
       if (result != null) {
         if (isObject(result)) {
@@ -409,34 +457,27 @@ class PluginContainer {
     code: string,
     id: string,
     options?: {
-      ssr?: boolean
       inMap?: SourceDescription['map']
     },
   ): Promise<{ code: string; map: SourceMap | { mappings: '' } | null }> {
+    const ssr = this.environment.config.consumer === 'server'
+    const optionsWithSSR = options ? { ...options, ssr } : { ssr }
     const inMap = options?.inMap
-    const ssr = options?.ssr
 
-    const ctx = new TransformPluginContext(
-      this,
-      id,
-      code,
-      inMap as SourceMap,
-      !!ssr,
-    )
+    const ctx = new TransformPluginContext(this, id, code, inMap as SourceMap)
     ctx._addedImports = this._getAddedImports(id)
 
     for (const plugin of this.getSortedPlugins('transform')) {
-      if (this._closed && !ssr) throwClosedServerError()
-      if (!plugin.transform) continue
+      if (this._closed && this.environment.config.dev.recoverable)
+        throwClosedServerError()
 
       ctx._updateActiveInfo(plugin, id, code)
-
       const start = debugPluginTransform ? performance.now() : 0
       let result: TransformResult | string | undefined
       const handler = getHookHandler(plugin.transform)
       try {
         result = await this.handleHookPromise(
-          handler.call(ctx as any, code, id, { ssr }),
+          handler.call(ctx as any, code, id, optionsWithSSR),
         )
       } catch (e) {
         ctx.error(e)
@@ -445,7 +486,7 @@ class PluginContainer {
       debugPluginTransform?.(
         timeFrom(start),
         plugin.name,
-        prettifyUrl(id, this.config.root),
+        prettifyUrl(id, this.environment.config.root),
       )
       if (isObject(result)) {
         if (result.code !== undefined) {
@@ -475,7 +516,7 @@ class PluginContainer {
   ): Promise<void> {
     await this.hookParallel(
       'watchChange',
-      (plugin) => this._getPluginContext(plugin, false),
+      (plugin) => this._getPluginContext(plugin),
       () => [id, change],
     )
   }
@@ -484,41 +525,85 @@ class PluginContainer {
     if (this._closed) return
     this._closed = true
     await Promise.allSettled(Array.from(this._processesing))
+    const config = this.environment.getTopLevelConfig()
     await this.hookParallel(
       'buildEnd',
-      (plugin) => this._getPluginContext(plugin, false),
+      (plugin) => this._getPluginContext(plugin),
       () => [],
+      (plugin) =>
+        this.environment.name === 'client' ||
+        config.server.perEnvironmentStartEndDuringDev ||
+        plugin.perEnvironmentStartEndDuringDev,
     )
     await this.hookParallel(
       'closeBundle',
-      (plugin) => this._getPluginContext(plugin, false),
+      (plugin) => this._getPluginContext(plugin),
       () => [],
     )
   }
 }
 
-class PluginContext implements Omit<RollupPluginContext, 'cache'> {
-  protected _scan = false
-  protected _resolveSkips?: Set<Plugin>
-  protected _activeId: string | null = null
-  protected _activeCode: string | null = null
+class MinimalPluginContext implements RollupMinimalPluginContext {
+  constructor(
+    public meta: PluginContextMeta,
+    public environment: Environment,
+  ) {}
 
-  meta: RollupPluginContext['meta']
+  debug(rawLog: string | RollupLog | (() => string | RollupLog)): void {
+    const log = this._normalizeRawLog(rawLog)
+    const msg = buildErrorMessage(log, [`debug: ${log.message}`], false)
+    debugPluginContainerContext?.(msg)
+  }
+
+  info(rawLog: string | RollupLog | (() => string | RollupLog)): void {
+    const log = this._normalizeRawLog(rawLog)
+    const msg = buildErrorMessage(log, [`info: ${log.message}`], false)
+    this.environment.logger.info(msg, { clear: true, timestamp: true })
+  }
+
+  warn(rawLog: string | RollupLog | (() => string | RollupLog)): void {
+    const log = this._normalizeRawLog(rawLog)
+    const msg = buildErrorMessage(
+      log,
+      [colors.yellow(`warning: ${log.message}`)],
+      false,
+    )
+    this.environment.logger.warn(msg, { clear: true, timestamp: true })
+  }
+
+  error(e: string | RollupError): never {
+    const err = (typeof e === 'string' ? new Error(e) : e) as RollupError
+    throw err
+  }
+
+  private _normalizeRawLog(
+    rawLog: string | RollupLog | (() => string | RollupLog),
+  ): RollupLog {
+    const logValue = typeof rawLog === 'function' ? rawLog() : rawLog
+    return typeof logValue === 'string' ? new Error(logValue) : logValue
+  }
+}
+
+class PluginContext
+  extends MinimalPluginContext
+  implements Omit<RollupPluginContext, 'cache'>
+{
+  ssr = false
+  _scan = false
+  _activeId: string | null = null
+  _activeCode: string | null = null
+  _resolveSkips?: Set<Plugin>
+  _resolveSkipCalls?: readonly SkipInformation[]
 
   constructor(
     public _plugin: Plugin,
-    public _container: PluginContainer,
-    public ssr: boolean,
+    public _container: EnvironmentPluginContainer,
   ) {
-    this.meta = this._container.minimalContext.meta
+    super(_container.minimalContext.meta, _container.environment)
   }
 
-  parse(code: string, opts: any): ReturnType<RollupPluginContext['parse']> {
+  parse(code: string, opts: any) {
     return rollupParseAst(code, opts)
-  }
-
-  getModuleInfo(id: string): ModuleInfo | null {
-    return this._container.getModuleInfo(id)
   }
 
   async resolve(
@@ -530,18 +615,35 @@ class PluginContext implements Omit<RollupPluginContext, 'cache'> {
       isEntry?: boolean
       skipSelf?: boolean
     },
-  ): ReturnType<RollupPluginContext['resolve']> {
-    let skip: Set<Plugin> | undefined
-    if (options?.skipSelf !== false && this._plugin) {
-      skip = new Set(this._resolveSkips)
-      skip.add(this._plugin)
+  ) {
+    let skipCalls: readonly SkipInformation[] | undefined
+    if (options?.skipSelf === false) {
+      skipCalls = this._resolveSkipCalls
+    } else if (this._resolveSkipCalls) {
+      const skipCallsTemp = [...this._resolveSkipCalls]
+      const sameCallIndex = this._resolveSkipCalls.findIndex(
+        (c) =>
+          c.id === id && c.importer === importer && c.plugin === this._plugin,
+      )
+      if (sameCallIndex !== -1) {
+        skipCallsTemp[sameCallIndex] = {
+          ...skipCallsTemp[sameCallIndex],
+          called: true,
+        }
+      } else {
+        skipCallsTemp.push({ id, importer, plugin: this._plugin })
+      }
+      skipCalls = skipCallsTemp
+    } else {
+      skipCalls = [{ id, importer, plugin: this._plugin }]
     }
+
     let out = await this._container.resolveId(id, importer, {
       attributes: options?.attributes,
       custom: options?.custom,
       isEntry: !!options?.isEntry,
-      skip,
-      ssr: this.ssr,
+      skip: this._resolveSkips,
+      skipCalls,
       scan: this._scan,
     })
     if (typeof out === 'string') out = { id: out }
@@ -555,20 +657,15 @@ class PluginContext implements Omit<RollupPluginContext, 'cache'> {
     } & Partial<PartialNull<ModuleOptions>>,
   ): Promise<ModuleInfo> {
     // We may not have added this to our module graph yet, so ensure it exists
-    await this._container.moduleGraph?.ensureEntryFromUrl(
-      unwrapId(options.id),
-      this.ssr,
-    )
+    await this._container.moduleGraph?.ensureEntryFromUrl(unwrapId(options.id))
     // Not all options passed to this function make sense in the context of loading individual files,
     // but we can at least update the module info properties we support
     this._updateModuleInfo(options.id, options)
 
-    const loadResult = await this._container.load(options.id, {
-      ssr: this.ssr,
-    })
+    const loadResult = await this._container.load(options.id)
     const code = typeof loadResult === 'object' ? loadResult?.code : loadResult
     if (code != null) {
-      await this._container.transform(code, options.id, { ssr: this.ssr })
+      await this._container.transform(code, options.id)
     }
 
     const moduleInfo = this.getModuleInfo(options.id)
@@ -579,7 +676,11 @@ class PluginContext implements Omit<RollupPluginContext, 'cache'> {
     return moduleInfo
   }
 
-  _updateModuleInfo(id: string, { meta }: { meta?: object | null }): void {
+  getModuleInfo(id: string): ModuleInfo | null {
+    return this._container.getModuleInfo(id)
+  }
+
+  _updateModuleInfo(id: string, { meta }: { meta?: object | null }) {
     if (meta) {
       const moduleInfo = this.getModuleInfo(id)
       if (moduleInfo) {
@@ -600,7 +701,7 @@ class PluginContext implements Omit<RollupPluginContext, 'cache'> {
       ensureWatchedFile(
         this._container.watcher,
         id,
-        this._container.config.root,
+        this.environment.config.root,
       )
   }
 
@@ -608,7 +709,7 @@ class PluginContext implements Omit<RollupPluginContext, 'cache'> {
     return [...this._container.watchFiles]
   }
 
-  emitFile(assetOrFile: EmittedFile): string {
+  emitFile(_assetOrFile: EmittedFile): string {
     this._warnIncompatibleMethod(`emitFile`)
     return ''
   }
@@ -622,43 +723,45 @@ class PluginContext implements Omit<RollupPluginContext, 'cache'> {
     return ''
   }
 
-  warn(
-    e: string | RollupLog | (() => string | RollupLog),
-    position?: number | { column: number; line: number },
-  ): void {
-    const err = this._formatError(typeof e === 'function' ? e() : e, position)
-    const msg = buildErrorMessage(
-      err,
-      [colors.yellow(`warning: ${err.message}`)],
-      false,
-    )
-    this._container.config.logger.warn(msg, {
-      clear: true,
-      timestamp: true,
-    })
+  override debug(log: string | RollupLog | (() => string | RollupLog)): void {
+    const err = this._formatLog(typeof log === 'function' ? log() : log)
+    super.debug(err)
   }
 
-  error(
+  override info(log: string | RollupLog | (() => string | RollupLog)): void {
+    const err = this._formatLog(typeof log === 'function' ? log() : log)
+    super.info(err)
+  }
+
+  override warn(
+    log: string | RollupLog | (() => string | RollupLog),
+    position?: number | { column: number; line: number },
+  ): void {
+    const err = this._formatLog(
+      typeof log === 'function' ? log() : log,
+      position,
+    )
+    super.warn(err)
+  }
+
+  override error(
     e: string | RollupError,
     position?: number | { column: number; line: number },
   ): never {
     // error thrown here is caught by the transform middleware and passed on
     // the the error middleware.
-    throw this._formatError(e, position)
+    throw this._formatLog(e, position)
   }
 
-  debug = noop
-  info = noop
-
-  private _formatError(
-    e: string | RollupError,
-    position: number | { column: number; line: number } | undefined,
-  ): RollupError {
-    const err = (typeof e === 'string' ? new Error(e) : e) as RollupError
+  private _formatLog<E extends RollupLog>(
+    e: string | E,
+    position?: number | { column: number; line: number } | undefined,
+  ): E {
+    const err = (typeof e === 'string' ? new Error(e) : e) as E
     if (err.pluginCode) {
       return err // The plugin likely called `this.error`
     }
-    if (this._plugin) err.plugin = this._plugin.name
+    err.plugin = this._plugin.name
     if (this._activeId && !err.id) err.id = this._activeId
     if (this._activeCode) {
       err.pluginCode = this._activeCode
@@ -671,7 +774,7 @@ class PluginContext implements Omit<RollupPluginContext, 'cache'> {
         try {
           errLocation = numberToPos(this._activeCode, pos)
         } catch (err2) {
-          this._container.config.logger.error(
+          this.environment.logger.error(
             colors.red(
               `Error in error handler:\n${err2.stack || err2.message}\n`,
             ),
@@ -710,7 +813,7 @@ class PluginContext implements Omit<RollupPluginContext, 'cache'> {
       if (
         this instanceof TransformPluginContext &&
         typeof err.loc?.line === 'number' &&
-        typeof err.loc?.column === 'number'
+        typeof err.loc.column === 'number'
       ) {
         const rawSourceMap = this._getCombinedSourcemap()
         if (rawSourceMap && 'version' in rawSourceMap) {
@@ -719,7 +822,7 @@ class PluginContext implements Omit<RollupPluginContext, 'cache'> {
             line: Number(err.loc.line),
             column: Number(err.loc.column),
           })
-          if (source && line != null && column != null) {
+          if (source) {
             err.loc = { file: source, line, column }
           }
         }
@@ -753,7 +856,7 @@ class PluginContext implements Omit<RollupPluginContext, 'cache'> {
   }
 
   _warnIncompatibleMethod(method: string): void {
-    this._container.config.logger.warn(
+    this.environment.logger.warn(
       colors.cyan(`[plugin:${this._plugin.name}] `) +
         colors.yellow(
           `context method ${colors.bold(
@@ -766,13 +869,14 @@ class PluginContext implements Omit<RollupPluginContext, 'cache'> {
 
 class ResolveIdContext extends PluginContext {
   constructor(
-    container: PluginContainer,
-    ssr: boolean,
+    container: EnvironmentPluginContainer,
     skip: Set<Plugin> | undefined,
+    skipCalls: readonly SkipInformation[] | undefined,
     scan: boolean,
   ) {
-    super(null!, container, ssr)
+    super(null!, container)
     this._resolveSkips = skip
+    this._resolveSkipCalls = skipCalls
     this._scan = scan
   }
 }
@@ -780,8 +884,8 @@ class ResolveIdContext extends PluginContext {
 class LoadPluginContext extends PluginContext {
   _addedImports: Set<string> | null = null
 
-  constructor(container: PluginContainer, ssr: boolean) {
-    super(null!, container, ssr)
+  constructor(container: EnvironmentPluginContainer) {
+    super(null!, container)
   }
 
   override addWatchFile(id: string): void {
@@ -804,13 +908,12 @@ class TransformPluginContext
   combinedMap: SourceMap | { mappings: '' } | null = null
 
   constructor(
-    container: PluginContainer,
+    container: EnvironmentPluginContainer,
     id: string,
     code: string,
-    inMap: SourceMap | string | undefined,
-    ssr: boolean,
+    inMap?: SourceMap | string,
   ) {
-    super(container, ssr)
+    super(container)
 
     this.filename = id
     this.originalCode = code
@@ -823,7 +926,7 @@ class TransformPluginContext
     }
   }
 
-  _getCombinedSourcemap(): SourceMap {
+  _getCombinedSourcemap(): SourceMap | { mappings: '' } | null {
     if (
       debugSourcemapCombine &&
       debugSourcemapCombineFilter &&
@@ -843,7 +946,7 @@ class TransformPluginContext
       combinedMap.mappings === ''
     ) {
       this.sourcemapChain.length = 0
-      return combinedMap as SourceMap
+      return combinedMap
     }
 
     for (let m of this.sourcemapChain) {
@@ -884,11 +987,11 @@ class TransformPluginContext
       this.combinedMap = combinedMap
       this.sourcemapChain.length = 0
     }
-    return this.combinedMap as SourceMap
+    return this.combinedMap
   }
 
   getCombinedSourcemap(): SourceMap {
-    const map = this._getCombinedSourcemap() as SourceMap | { mappings: '' }
+    const map = this._getCombinedSourcemap()
     if (!map || (!('version' in map) && map.mappings === '')) {
       return new MagicString(this.originalCode).generateMap({
         includeContent: true,
@@ -906,10 +1009,155 @@ class TransformPluginContext
   }
 }
 
-// We only expose the types but not the implementations
 export type {
-  PluginContainer,
-  PluginContext,
+  EnvironmentPluginContainer,
   TransformPluginContext,
   TransformResult,
 }
+
+// Backward compatibility
+class PluginContainer {
+  constructor(private environments: Record<string, Environment>) {}
+
+  // Backward compatibility
+  // Users should call pluginContainer.resolveId (and load/transform) passing the environment they want to work with
+  // But there is code that is going to call it without passing an environment, or with the ssr flag to get the ssr environment
+  private _getEnvironment(options?: {
+    ssr?: boolean
+    environment?: Environment
+  }) {
+    return options?.environment
+      ? options.environment
+      : this.environments[options?.ssr ? 'ssr' : 'client']
+  }
+
+  private _getPluginContainer(options?: {
+    ssr?: boolean
+    environment?: Environment
+  }) {
+    return (this._getEnvironment(options) as DevEnvironment).pluginContainer
+  }
+
+  getModuleInfo(id: string): ModuleInfo | null {
+    const clientModuleInfo = (
+      this.environments.client as DevEnvironment
+    ).pluginContainer.getModuleInfo(id)
+    const ssrModuleInfo = (
+      this.environments.ssr as DevEnvironment
+    ).pluginContainer.getModuleInfo(id)
+
+    if (clientModuleInfo == null && ssrModuleInfo == null) return null
+
+    return new Proxy({} as any, {
+      get: (_, key: string) => {
+        // `meta` refers to `ModuleInfo.meta` of both environments, so we also
+        // need to merge it here
+        if (key === 'meta') {
+          const meta: Record<string, any> = {}
+          if (ssrModuleInfo) {
+            Object.assign(meta, ssrModuleInfo.meta)
+          }
+          if (clientModuleInfo) {
+            Object.assign(meta, clientModuleInfo.meta)
+          }
+          return meta
+        }
+        if (clientModuleInfo) {
+          if (key in clientModuleInfo) {
+            return clientModuleInfo[key as keyof ModuleInfo]
+          }
+        }
+        if (ssrModuleInfo) {
+          if (key in ssrModuleInfo) {
+            return ssrModuleInfo[key as keyof ModuleInfo]
+          }
+        }
+      },
+    })
+  }
+
+  get options(): InputOptions {
+    return (this.environments.client as DevEnvironment).pluginContainer.options
+  }
+
+  // For backward compatibility, buildStart and watchChange are called only for the client environment
+  // buildStart is called per environment for a plugin with the perEnvironmentStartEndDuring dev flag
+
+  async buildStart(_options?: InputOptions): Promise<void> {
+    ;(this.environments.client as DevEnvironment).pluginContainer.buildStart(
+      _options,
+    )
+  }
+
+  async watchChange(
+    id: string,
+    change: { event: 'create' | 'update' | 'delete' },
+  ): Promise<void> {
+    ;(this.environments.client as DevEnvironment).pluginContainer.watchChange(
+      id,
+      change,
+    )
+  }
+
+  async resolveId(
+    rawId: string,
+    importer?: string,
+    options?: {
+      attributes?: Record<string, string>
+      custom?: CustomPluginOptions
+      /** @deprecated use `skipCalls` instead */
+      skip?: Set<Plugin>
+      skipCalls?: readonly SkipInformation[]
+      ssr?: boolean
+      /**
+       * @internal
+       */
+      scan?: boolean
+      isEntry?: boolean
+    },
+  ): Promise<PartialResolvedId | null> {
+    return this._getPluginContainer(options).resolveId(rawId, importer, options)
+  }
+
+  async load(
+    id: string,
+    options?: {
+      ssr?: boolean
+    },
+  ): Promise<LoadResult | null> {
+    return this._getPluginContainer(options).load(id)
+  }
+
+  async transform(
+    code: string,
+    id: string,
+    options?: {
+      ssr?: boolean
+      environment?: Environment
+      inMap?: SourceDescription['map']
+    },
+  ): Promise<{ code: string; map: SourceMap | { mappings: '' } | null }> {
+    return this._getPluginContainer(options).transform(code, id, options)
+  }
+
+  async close(): Promise<void> {
+    // noop, close will be called for each environment
+  }
+}
+
+/**
+ * server.pluginContainer compatibility
+ *
+ * The default environment is in buildStart, buildEnd, watchChange, and closeBundle hooks,
+ * which are called once for all environments, or when no environment is passed in other hooks.
+ * The ssrEnvironment is needed for backward compatibility when the ssr flag is passed without
+ * an environment. The defaultEnvironment in the main pluginContainer in the server should be
+ * the client environment for backward compatibility.
+ **/
+export function createPluginContainer(
+  environments: Record<string, Environment>,
+): PluginContainer {
+  return new PluginContainer(environments)
+}
+
+export type { PluginContainer }

@@ -8,23 +8,10 @@ export default defineConfig({
     preprocessorOptions: {
       ...baseConfig.css.preprocessorOptions,
       scss: {
+        .../** @type {import('vite').SassPreprocessorOptions & { api?: undefined }} */ (
+          baseConfig.css.preprocessorOptions.scss
+        ),
         api: 'modern',
-        additionalData: `$injectedColor: orange;`,
-        importers: [
-          {
-            canonicalize(url) {
-              return url === 'virtual-dep'
-                ? new URL('custom-importer:virtual-dep')
-                : null
-            },
-            load() {
-              return {
-                contents: ``,
-                syntax: 'scss',
-              }
-            },
-          },
-        ],
       },
     },
   },

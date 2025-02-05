@@ -1,5 +1,6 @@
 import { defineConfig } from 'vite'
 import type { Plugin } from 'vite'
+import tailwindcss from '@tailwindcss/vite'
 
 function delayIndexCssPlugin(): Plugin {
   let server
@@ -27,11 +28,6 @@ export default defineConfig({
     // to make tests faster
     minify: false,
   },
-  server: {
-    // This option caused issues with HMR,
-    // although it should not affect the build
-    origin: 'http://localhost:8080',
-  },
   plugins: [
     {
       name: 'delay view',
@@ -43,5 +39,6 @@ export default defineConfig({
       },
     },
     delayIndexCssPlugin(),
+    tailwindcss(),
   ],
 })

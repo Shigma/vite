@@ -15,7 +15,7 @@ import { fromComment } from 'convert-source-map'
 import type { Assertion } from 'vitest'
 import { expect } from 'vitest'
 import type { ResultPromise as ExecaResultPromise } from 'execa'
-import { isBuild, isWindows, page, testDir } from './vitestSetup'
+import { isWindows, page, testDir } from './vitestSetup'
 
 export * from './vitestSetup'
 
@@ -46,6 +46,10 @@ export const ports = {
   'css/postcss-plugins-different-dir': 5006,
   'css/dynamic-import': 5007,
   'css/lightningcss-proxy': 5008,
+  'backend-integration': 5009,
+  'client-reload': 5010,
+  'client-reload/hmr-port': 5011,
+  'client-reload/cross-origin': 5012,
 }
 export const hmrPorts = {
   'optimize-missing-deps': 24680,
@@ -57,6 +61,8 @@ export const hmrPorts = {
   'css/lightningcss-proxy': 24686,
   json: 24687,
   'ssr-conditions': 24688,
+  'client-reload/hmr-port': 24689,
+  'client-reload/cross-origin': 24690,
 }
 
 const hexToNameMap: Record<string, string> = {}
@@ -69,7 +75,7 @@ function componentToHex(c: number): string {
   return hex.length === 1 ? '0' + hex : hex
 }
 
-function rgbToHex(rgb: string): string {
+function rgbToHex(rgb: string): string | undefined {
   const match = rgb.match(/rgb\((\d+),\s*(\d+),\s*(\d+)\)/)
   if (match) {
     const [_, rs, gs, bs] = match
@@ -79,9 +85,8 @@ function rgbToHex(rgb: string): string {
       componentToHex(parseInt(gs, 10)) +
       componentToHex(parseInt(bs, 10))
     )
-  } else {
-    return '#000000'
   }
+  return undefined
 }
 
 const timeout = (n: number) => new Promise((r) => setTimeout(r, n))
@@ -131,9 +136,7 @@ export function readFile(filename: string): string {
 export function editFile(
   filename: string,
   replacer: (str: string) => string,
-  runInBuild: boolean = false,
 ): void {
-  if (isBuild && !runInBuild) return
   filename = path.resolve(testDir, filename)
   const content = fs.readFileSync(filename, 'utf-8')
   const modified = replacer(content)
@@ -141,7 +144,9 @@ export function editFile(
 }
 
 export function addFile(filename: string, content: string): void {
-  fs.writeFileSync(path.resolve(testDir, filename), content)
+  const resolvedFilename = path.resolve(testDir, filename)
+  fs.mkdirSync(path.dirname(resolvedFilename), { recursive: true })
+  fs.writeFileSync(resolvedFilename, content)
 }
 
 export function removeFile(filename: string): void {
@@ -195,10 +200,13 @@ export function readManifest(base = ''): Manifest {
   )
 }
 
-export function readDepOptimizationMetadata(): DepOptimizationMetadata {
+export function readDepOptimizationMetadata(
+  environmentName = 'client',
+): DepOptimizationMetadata {
+  const suffix = environmentName === 'client' ? '' : `_${environmentName}`
   return JSON.parse(
     fs.readFileSync(
-      path.join(testDir, 'node_modules/.vite/deps/_metadata.json'),
+      path.join(testDir, `node_modules/.vite/deps${suffix}/_metadata.json`),
       'utf-8',
     ),
   )
@@ -210,9 +218,7 @@ export function readDepOptimizationMetadata(): DepOptimizationMetadata {
 export async function untilUpdated(
   poll: () => string | Promise<string>,
   expected: string | RegExp,
-  runInBuild = false,
 ): Promise<void> {
-  if (isBuild && !runInBuild) return
   const maxTries = process.env.CI ? 200 : 50
   for (let tries = 0; tries < maxTries; tries++) {
     const actual = (await poll()) ?? ''
@@ -233,11 +239,7 @@ export async function untilUpdated(
 /**
  * Retry `func` until it does not throw error.
  */
-export async function withRetry(
-  func: () => Promise<void>,
-  runInBuild = false,
-): Promise<void> {
-  if (isBuild && !runInBuild) return
+export async function withRetry(func: () => Promise<void>): Promise<void> {
   const maxTries = process.env.CI ? 200 : 50
   for (let tries = 0; tries < maxTries; tries++) {
     try {
@@ -255,10 +257,7 @@ export const expectWithRetry = <T>(getActual: () => Promise<T>) => {
     {
       get(_target, key) {
         return async (...args) => {
-          await withRetry(
-            async () => expect(await getActual())[key](...args),
-            true,
-          )
+          await withRetry(async () => expect(await getActual())[key](...args))
         }
       },
     },

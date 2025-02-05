@@ -13,6 +13,10 @@ export default defineConfig({
       './playground/**/*.*',
       './playground-temp/**/*.*',
     ],
+    deps: {
+      // we specify 'packages' so Vitest doesn't inline the files
+      moduleDirectories: ['node_modules', 'packages'],
+    },
     testTimeout: 20000,
     isolate: false,
   },
@@ -22,9 +26,9 @@ export default defineConfig({
   publicDir: false,
   resolve: {
     alias: {
-      'vite/runtime': path.resolve(
+      'vite/module-runner': path.resolve(
         _dirname,
-        './packages/vite/src/runtime/index.ts',
+        './packages/vite/src/module-runner/index.ts',
       ),
     },
   },

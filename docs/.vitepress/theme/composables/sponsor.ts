@@ -25,6 +25,12 @@ const data = ref()
 const dataHost = 'https://sponsors.vuejs.org'
 const dataUrl = `${dataHost}/vite.json`
 
+export const voidZero = {
+  name: 'VoidZero',
+  url: 'https://voidzero.dev',
+  img: '/voidzero.svg',
+} satisfies Sponsor
+
 const viteSponsors: Pick<Sponsors, 'special' | 'gold'> = {
   special: [
     // sponsors patak-dev
@@ -99,7 +105,7 @@ export function useSponsor() {
 function mapSponsors(sponsors: Sponsors) {
   return [
     {
-      tier: 'Special Sponsors',
+      tier: 'in partnership with',
       size: 'big',
       items: viteSponsors['special'],
     },
